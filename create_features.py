@@ -217,6 +217,71 @@ def add_rolling_features(df, player_rolling_stats, window=10):
     
     return df_features
 
+def add_head_to_head_features(df):
+    """Add head-to-head record features for each matchup.
+    
+    Args:
+        df: DataFrame containing match data
+        
+    Returns:
+        pandas.DataFrame: DataFrame with added head-to-head features
+    """
+    logging.info("Adding head-to-head record features")
+    
+    # Create a copy of the DataFrame to avoid modifying the original
+    df_features = df.copy()
+    
+    # Initialize head-to-head record columns
+    df_features['w_previous_wins'] = 0
+    df_features['l_previous_wins'] = 0
+    
+    # Dictionary to track head-to-head records
+    h2h_records = {}  # Format: (player1_id, player2_id) -> [player1_wins, player2_wins]
+    
+    # Process matches in chronological order
+    for idx, match in tqdm(df.iterrows(), total=len(df), desc="Adding head-to-head features"):
+        winner_id = match['winner_id']
+        loser_id = match['loser_id']
+        
+        # Create a unique key for this matchup (always put the smaller ID first for consistency)
+        if winner_id < loser_id:
+            matchup_key = (winner_id, loser_id)
+            is_winner_first = True
+        else:
+            matchup_key = (loser_id, winner_id)
+            is_winner_first = False
+        
+        # Get current head-to-head record
+        if matchup_key in h2h_records:
+            record = h2h_records[matchup_key]
+            
+            # Assign previous wins to the correct players
+            if is_winner_first:
+                df_features.loc[idx, 'w_previous_wins'] = record[0]
+                df_features.loc[idx, 'l_previous_wins'] = record[1]
+            else:
+                df_features.loc[idx, 'w_previous_wins'] = record[1]
+                df_features.loc[idx, 'l_previous_wins'] = record[0]
+            
+            # Update the record after the match
+            if is_winner_first:
+                record[0] += 1  # Winner won and is first in the key
+            else:
+                record[1] += 1  # Winner won and is second in the key
+        else:
+            # First meeting between these players
+            df_features.loc[idx, 'w_previous_wins'] = 0
+            df_features.loc[idx, 'l_previous_wins'] = 0
+            
+            # Initialize the record
+            if is_winner_first:
+                h2h_records[matchup_key] = [1, 0]  # Winner is first in the key
+            else:
+                h2h_records[matchup_key] = [0, 1]  # Winner is second in the key
+    
+    logging.info(f"Added head-to-head records for {len(h2h_records)} matchups")
+    return df_features
+
 def main():
     logging.info("Starting feature creation script")
     
@@ -232,6 +297,9 @@ def main():
     
     # Add rolling features to the matches DataFrame
     df_features = add_rolling_features(df, player_rolling_stats, window)
+    
+    # Add head-to-head features
+    df_features = add_head_to_head_features(df_features)
     
     # Write the features to a new CSV
     output_file = "atp_matches_with_features.csv"

@@ -1,0 +1,779 @@
+---
+output:
+  pdf_document: default
+  html_document: default
+---
+```{r}
+library(tidyverse)
+library(PlayerRatings)
+library(BradleyTerry2)
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+```
+
+```{r}
+matches <- read.csv("atp_matches_with_features.csv")
+
+# remove matches with carpet surface
+matches <- matches %>% filter(surface != "Carpet")
+
+# sort by date
+matches$tourney_date <- as.Date(matches$tourney_date)
+matches <- matches[order(matches$tourney_date), ]
+
+# identify all winner rolling columns
+w_rolling_cols <- grep("^w_rolling_10_", colnames(matches), value = TRUE)
+
+# create difference columns dynamically
+for (col in w_rolling_cols) {
+  base_stat <- sub("^w_rolling_10_", "", col)
+  l_col <- paste0("l_rolling_10_", base_stat)
+  
+  if (l_col %in% colnames(matches)) {
+    diff_col <- paste0("diff_rolling_10_", base_stat)
+    matches[[diff_col]] <- matches[[col]] - matches[[l_col]]
+  }
+}
+
+# diff feature
+matches$diff_h2h = matches$w_previous_wins - matches$l_previous_wins
+
+# win loss for BT
+matches$win  <- 1L
+matches$loss <- 0L
+```
+
+```{r}
+### ADD ELO ###
+
+# 0. Make sure your full `matches` is sorted by date
+matches <- matches[order(matches$tourney_date), ]
+
+# 1. Initialize
+initial_rating  <- 1500
+k_factor        <- 20
+all_players     <- unique(c(matches$winner_name, matches$loser_name))
+# start everybody at 1500
+current_ratings <- setNames(
+  rep(initial_rating, length(all_players)),
+  all_players
+)
+
+# 2. Pre-allocate three new columns
+matches$elo_w     <- NA_real_   # winner’s rating *before* the match
+matches$elo_l     <- NA_real_   # loser’s rating  *before* the match
+matches$elo_prob  <- NA_real_   # predicted win prob from Elo
+matches$diff_elo  <- NA_real_   # to enrich BT
+
+
+# 3. helper for win-prob
+calculate_win_prob <- function(diff) 1 / (1 + 10^(-diff/400))
+
+# 4. loop through every match in chronological order
+for (i in seq_len(nrow(matches))) {
+  w <- matches$winner_name[i]
+  l <- matches$loser_name[i]
+  
+  # 4a. get pre-match ratings (default 1500 if brand-new)
+  r_w <- current_ratings[w]
+  r_l <- current_ratings[l]
+  
+  # 4b. record them
+  matches$elo_w[i]    <- r_w
+  matches$elo_l[i]    <- r_l
+  
+  # 4c. compute predicted win-prob
+  p_win             <- calculate_win_prob(r_w - r_l)
+  matches$elo_prob[i] <- p_win
+  matches$diff_elo[i] <- r_w - r_l
+  
+  # 4d. update with outcome
+  current_ratings[w] <- r_w + k_factor * (1 - p_win)
+  current_ratings[l] <- r_l + k_factor * (0 - (1 - p_win))
+}
+```
+
+```{r}
+### TRAN TEST SPLIT ###
+matches$season <- as.numeric(format(matches$tourney_date, "%Y"))
+train_matches <- matches %>% filter(season < 2024) %>% filter(season >= 2019)
+test_matches  <- matches %>% filter(season == 2024)
+
+# filter and drop anyone who has only won or only lost in dataset
+filter_pure_players <- function(df) {
+  wins <- df %>%
+    count(player = winner_name, name = "n_wins")
+  
+  losses <- df %>%
+    count(player = loser_name,  name = "n_losses")
+  
+  counts <- full_join(wins, losses, by = "player") %>%
+    replace_na(list(n_wins = 0, n_losses = 0)) %>%
+    mutate(n_total = n_wins + n_losses)
+
+  bad_players <- counts %>%
+    filter(
+      (n_wins == 0 | n_losses == 0) |
+      (n_total <  10)
+    ) %>%
+    pull(player)
+
+  df %>%
+    filter(
+      !as.character(winner_name) %in% bad_players,
+      !as.character(loser_name)  %in% bad_players
+    )
+}
+
+train_matches <- filter_pure_players(train_matches)
+test_matches <- filter_pure_players(test_matches)
+
+cat("Training set matches:", nrow(train_matches), "\n")
+cat("Testing set matches:", nrow(test_matches), "\n")
+```
+
+```{r}
+### ELO ###
+
+# elo
+train_games <- data.frame(
+  Date  = as.numeric(format(train_matches$tourney_date, "%Y%m%d")),
+  Team1 = train_matches$winner_name,
+  Team2 = train_matches$loser_name,
+  Score = 1,                   
+  stringsAsFactors = FALSE
+)
+elo_model_train <- elo(train_games, init = 1500, kfac = 20, gamma = 0)
+
+# top 10 players
+elo_ratings_train <- elo_model_train$ratings
+elo_ratings_train <- elo_ratings_train[order(elo_ratings_train$Rating, decreasing = TRUE), ]
+top10_elo_train <- head(elo_ratings_train, 10)
+print(top10_elo_train)
+
+# plot distribution of Elo ratings based on training data
+hist(elo_ratings_train$Rating, 
+     main = "Distribution of Elo Ratings (Training Data)", 
+     xlab = "Elo Rating", 
+     col = "skyblue",
+     breaks = 30)
+```
+
+```{r}
+# evaluation metrics
+correct_prediction <- test_matches$elo_prob > 0.5
+accuracy <- mean(correct_prediction, na.rm = TRUE)
+misclassification_rate <- 1 - accuracy
+cat("Misclassification Rate:", misclassification_rate, "\n")
+
+brier_score <- (1 - test_matches$elo_prob)^2
+mean_brier_score <- mean(brier_score, na.rm = TRUE)
+cat("Mean Brier Score:", mean_brier_score, "\n")
+```
+
+```{r}
+# look at elo's biggest fails
+worst_elo <- matches %>%
+  # only consider rows where we actually computed elo_prob
+  filter(!is.na(elo_prob)) %>%
+  # sort by ascending elo_prob
+  arrange(elo_prob) %>%
+  # take the 10 lowest
+  slice_head(n = 10)
+
+print(worst_elo)
+```
+
+```{r}
+extract_diff_coefficients <- function(model, pattern = "^diff", sort_by = "p.value", sort = TRUE) {
+  coef_table <- summary(model)$coefficients
+  matching_rows <- grep(pattern, rownames(coef_table))
+    results <- data.frame(
+    term      = rownames(coef_table)[matching_rows],
+    estimate  = coef_table[matching_rows, "Estimate"],
+    p.value   = coef_table[matching_rows, "Pr(>|z|)"],
+    row.names = NULL
+  )
+  if (sort) {
+    results <- results[order(results[[sort_by]], decreasing = FALSE), ]
+  }
+  results
+}
+
+evaluate_glm_model <- function(model, test_data, newdata, valid_idx, prediction_col = "pred_prob", threshold = 0.5) {
+  preds <- predict(
+    model, 
+    newdata = newdata, 
+    type = "response"
+  )
+  
+  test_data[[prediction_col]] <- NA_real_
+  test_data[[prediction_col]][valid_idx] <- preds
+  
+  correct_prediction <- test_data[[prediction_col]] > threshold
+  accuracy <- mean(correct_prediction, na.rm = TRUE)
+  misclassification_rate <- 1 - accuracy
+  
+  brier_score <- (1 - test_data[[prediction_col]])^2
+  mean_brier_score <- mean(brier_score, na.rm = TRUE)
+  
+  cat("Evaluation Results:\n")
+  cat("------------------\n")
+  cat("Misclassification Rate:", round(misclassification_rate, 4), "\n")
+  cat("Mean Brier Score:", round(mean_brier_score, 4), "\n")
+  
+  # Return results as a list
+  results <- list(
+    predictions = test_data[[prediction_col]],
+    accuracy = accuracy,
+    misclassification_rate = misclassification_rate,
+    mean_brier_score = mean_brier_score,
+    test_data = test_data
+  )
+  
+  return(results)
+}
+```
+
+```{r}
+# train levels
+all_players <- (unique(c(train_matches$winner_name,
+                             train_matches$loser_name)))
+
+train_matches$winner_name = factor(train_matches$winner_name, levels = all_players)
+train_matches$loser_name = factor(train_matches$loser_name, levels = all_players)
+
+# re-level the test set to exactly those levels used in train
+test_matches$winner_name = factor(test_matches$winner_name, levels = all_players)
+test_matches$loser_name = factor(test_matches$loser_name, levels = all_players)
+
+# drop any rows that now have NA (i.e. brand-new players unseen in train)
+valid_idx <- which(
+  !is.na(test_matches$winner_name) &
+  !is.na(test_matches$loser_name)
+)
+
+test_valid <- test_matches[valid_idx, ]
+nrow(test_matches)
+nrow(test_valid)
+```
+
+```{r}
+#### VANILLA BT ###
+X <- model.matrix(~ train_matches$winner_name - 1) - model.matrix(~ train_matches$loser_name - 1)
+
+model <- glm(train_matches$win ~ X[, -1] - 1, family = binomial, data = train_matches)
+
+ratings <- coef(model)
+ratings_df <- data.frame(
+  player = names(ratings),
+  rating = ratings
+)
+ratings_df$player <- sub("^.*winner_name", "", ratings_df$player)
+
+sorted_ratings_df <- ratings_df[order(ratings_df$rating, decreasing = TRUE), ]
+top10 <- sorted_ratings_df[1:10, ]
+
+# Print the top 10 rated players.
+cat("Top 10 Rated Players (Higher rating = stronger):\n")
+print(top10)
+```
+
+```{r}
+# test
+predict_probs <- function(tourney_df, ratings_df) {
+  tourney_df %>%
+    left_join(ratings_df, by = c("winner_name" = "player")) %>%
+    rename(W_rating = rating) %>%
+    left_join(ratings_df, by = c("loser_name" = "player")) %>%
+    rename(L_rating = rating) %>%
+    mutate(
+      pred_prob = exp(W_rating) / (exp(W_rating) + exp(L_rating))
+    )
+}
+
+pred_prob <- predict_probs(test_matches, ratings_df)$pred_prob
+
+# evaluation metrics
+correct_prediction <- pred_prob > 0.5
+accuracy <- mean(correct_prediction, na.rm = TRUE)
+misclassification_rate <- 1 - accuracy
+cat("Misclassification Rate:", misclassification_rate, "\n")
+
+brier_score <- (1 - pred_prob)^2
+mean_brier_score <- mean(brier_score, na.rm = TRUE)
+cat("Mean Brier Score:", mean_brier_score, "\n")
+```
+
+```{r}
+### BT WITH COVARIATES ####
+covariates <- c(
+  "diff_rolling_10_ace_per_svgm",                
+  "diff_rolling_10_df_per_svgm",                 
+  "diff_rolling_10_svpt_per_svgm",               
+  "diff_rolling_10_1stIn_per_svgm",              
+  "diff_rolling_10_1stWon_per_svgm",             
+  "diff_rolling_10_2ndWon_per_svgm",             
+  "diff_rolling_10_SvGms",                       
+  "diff_rolling_10_bpSaved_per_svgm",            
+  "diff_rolling_10_bpSaved_per_bpFaced_per_svgm",
+  "diff_rolling_10_bpFaced_per_svgm",            
+  "diff_rolling_10_rank",                        
+  "diff_rolling_10_ht",                          
+  "diff_rolling_10_age",
+  "diff_h2h"
+)
+cov_str <- paste(covariates, collapse = " + ")
+
+model_w_diffs <- glm(
+  as.formula(
+    paste0(
+      "win ~ X[, -1] + ",
+      cov_str,
+      " - 1"
+    )
+  ),
+  data   = train_matches,
+  family = binomial(link = "logit")
+)
+
+diff_coefs <- extract_diff_coefficients(model_w_diffs)
+diff_coefs
+```
+
+```{r}
+# combine into one newdata frame
+X <- model.matrix(~ test_valid$winner_name - 1) - model.matrix(~ test_valid$loser_name - 1)
+newdata <- cbind(
+  as.data.frame(X),
+  test_valid[, covariates, drop = FALSE]
+)
+
+results <- evaluate_glm_model(
+    model = model_w_diffs,
+    test_data = test_matches,
+    newdata = newdata,
+    valid_idx = valid_idx
+)
+```
+
+```{r}
+### BT WITH COVARIATES REDUCED ####
+covariates <- c(
+  #"diff_rolling_10_ace_per_svgm",                
+  "diff_rolling_10_df_per_svgm",                 
+  "diff_rolling_10_svpt_per_svgm",               
+  #"diff_rolling_10_1stIn_per_svgm",              
+  "diff_rolling_10_1stWon_per_svgm",             
+  "diff_rolling_10_2ndWon_per_svgm",             
+  #"diff_rolling_10_SvGms",                       
+  #"diff_rolling_10_bpSaved_per_svgm",            
+  "diff_rolling_10_bpSaved_per_bpFaced_per_svgm",
+  "diff_rolling_10_bpFaced_per_svgm",            
+  "diff_rolling_10_rank",                        
+  "diff_rolling_10_ht",                          
+  "diff_rolling_10_age",
+  "diff_h2h"
+)
+cov_str <- paste(covariates, collapse = " + ")
+
+X <- model.matrix(~ train_matches$winner_name - 1) - model.matrix(~ train_matches$loser_name - 1)
+model_w_diffs_red <- glm(
+  as.formula(
+    paste0(
+      "win ~ X[, -1] + ",
+      cov_str,
+      " - 1"
+    )
+  ),
+  data   = train_matches,
+  family = binomial(link = "logit")
+)
+
+diff_coefs <- extract_diff_coefficients(model_w_diffs_red, sort=TRUE)
+diff_coefs
+```
+
+```{r}
+# combine into one newdata frame
+X <- model.matrix(~ test_valid$winner_name - 1) - model.matrix(~ test_valid$loser_name - 1)
+newdata <- cbind(
+  as.data.frame(X),
+  test_valid[, covariates, drop = FALSE]
+)
+
+results <- evaluate_glm_model(
+    model = model_w_diffs_red,
+    test_data = test_matches,
+    newdata = newdata,
+    valid_idx = valid_idx
+)
+```
+
+```{r}
+### BT WITH COVARIATES REDUCED BY SURFACE ####
+X <- model.matrix(~ train_matches$winner_name - 1) - model.matrix(~ train_matches$loser_name - 1)
+model_w_diffs_surface <- glm(
+  as.formula(
+    paste0(
+      "win ~ X[, -1] + (",
+      cov_str,
+      ") : surface - 1"
+    )
+  ),
+  data   = train_matches,
+  family = binomial(link = "logit")
+)
+
+diff_coefs <- extract_diff_coefficients(model_w_diffs_surface, sort=FALSE)
+diff_coefs
+```
+
+```{r}
+# combine into one newdata frame
+X <- model.matrix(~ test_valid$winner_name - 1) - model.matrix(~ test_valid$loser_name - 1)
+newdata <- cbind(
+  as.data.frame(model.matrix(~ test_valid$winner_name - 1) - model.matrix(~ test_valid$loser_name - 1)),
+  test_valid[, covariates, drop = FALSE],
+  surface = test_valid$surface
+)
+
+results <- evaluate_glm_model(
+    model = model_w_diffs_surface,
+    test_data = test_matches,
+    newdata = newdata,
+    valid_idx = valid_idx
+)
+```
+
+```{r}
+# height
+train_matches %>%
+  summarize(
+    n = n(),
+    n_NA  = sum(is.na(diff_rolling_10_ht)),
+    min_ht = min(diff_rolling_10_ht, na.rm=TRUE),
+    max_ht = max(diff_rolling_10_ht, na.rm=TRUE),
+    sd_ht  = sd(diff_rolling_10_ht, na.rm=TRUE)
+  )
+
+train_matches$diff_rolling_10_ht 
+```
+
+```{r}
+### EXAMINE STAT DIFFERENCES BETWEEN TOP GROUP VS WORST GROUP  ###
+# 1. pick the vars to test
+test_vars <- covariates
+
+# 2. label each match as 'Upset' or 'FavoriteWin'
+cmp_df <- matches %>%
+  filter(!is.na(elo_prob)) %>%
+  mutate(
+    result_group = case_when(
+      elo_prob <  0.2 ~ "Upset",
+      elo_prob >  0.8 ~ "FavoriteWin",
+      TRUE             ~ NA_character_
+    )
+  ) %>%
+  filter(!is.na(result_group))
+
+# 3. run t‐tests for each variable
+ttests <- map_dfr(test_vars, function(var){
+  x <- pull(cmp_df, var)[cmp_df$result_group == "Upset"]
+  y <- pull(cmp_df, var)[cmp_df$result_group == "FavoriteWin"]
+  t  <- t.test(y, x)
+  tibble(
+    stat          = var,
+    mean_fav      = mean(y, na.rm=TRUE),
+    mean_upset    = mean(x, na.rm=TRUE),
+    diff_means    = mean(y, na.rm=TRUE) - mean(x, na.rm=TRUE),
+    t_statistic   = t$statistic,
+    p_value       = t$p.value
+  )
+}) %>%
+  arrange(diff_means)
+
+ttests <- ttests[order(ttests$p_value), ]
+ttests
+
+# 4. visualize distributions side‐by‐side
+cmp_df %>%
+  select(result_group, all_of(test_vars)) %>%
+  pivot_longer(-result_group, names_to="stat", values_to="value") %>%
+  ggplot(aes(x=result_group, y=value, fill=result_group)) +
+    geom_boxplot(alpha=0.6) +
+    facet_wrap(~stat, scales="free") +
+    labs(
+      x = "Match outcome group",
+      y = "Pre-match diff value",
+      title = "Upset vs Favorite‐Win: Distributions of Key Diff Stats"
+    ) +
+    theme_minimal() +
+    theme(legend.position="none")
+
+
+```
+
+```{r}
+### DEPRECATED: TOO MUCH SPARSITY IN PLAYER-SURFACE BT ###
+# 1. build the universe of all player×surface combos
+all_players  <- sort(unique(c(as.character(train_matches$winner_name),
+                          as.character(train_matches$loser_name))))
+surfaces <- sort(unique(as.character(train_matches$surface)))
+
+all_surf_lvls <- as.vector(outer(all_players, surfaces,
+                                 FUN = function(p, s) paste(p, s, sep = ".")))
+
+train_df <- train_matches %>%
+  mutate(
+    w_surf = factor(paste(winner_name, surface, sep = "."), levels = all_surf_lvls),
+    l_surf = factor(paste(loser_name,  surface, sep = "."), levels = all_surf_lvls)
+  )
+
+
+# 2. create winner×surface and loser×surface factors with those levels
+train_df <- train_df %>%
+  mutate(
+    w_surf = factor(paste(winner_name, surface, sep = "."), levels = all_surf_lvls),
+    l_surf = factor(paste(loser_name,  surface, sep = "."), levels = all_surf_lvls)
+  )
+
+# 3. now build BT design matrices
+Xw_surf   <- model.matrix(~ w_surf - 1, data = train_df)
+Xl_surf   <- model.matrix(~ l_surf - 1, data = train_df)
+X_bt_surf <- Xw_surf - Xl_surf   # same columns in same order—you can subtract
+
+# 4. bind with your diff features and fit
+glm_input <- cbind(
+  win = train_df$win,
+  as.data.frame(X_bt_surf)
+)
+
+glm_surf <- glm(win ~ . - 1, data = glm_input, family = binomial)
+```
+
+```{r}
+# --- 1. Re-level test set to your training factors
+test_matches <- test_matches %>%
+  mutate(
+    winner_name = factor(winner_name, levels = all_players),
+    loser_name  = factor(loser_name,  levels = all_players),
+    surface     = factor(surface,     levels = surfaces)
+  )
+
+# 2. Drop any matches with unseen players
+valid_idx <- which(
+  !is.na(test_matches$winner_name) &
+  !is.na(test_matches$loser_name)  &
+  !is.na(test_matches$surface)      # <— drop matches on unseen surfaces
+)
+test_valid <- test_matches[valid_idx, ]
+
+# 3. Recreate the player×surface interaction on test
+test_valid <- test_valid %>%
+  mutate(
+    w_surf = factor(paste(winner_name, surface, sep="."), levels = all_surf_lvls),
+    l_surf = factor(paste(loser_name,  surface, sep="."), levels = all_surf_lvls)
+  )
+
+# 4. Build the BT design matrix for player×surface
+Xw_surf_test <- model.matrix(~ w_surf - 1, data = test_valid)
+Xl_surf_test <- model.matrix(~ l_surf - 1, data = test_valid)
+X_bt_surf_test <- Xw_surf_test - Xl_surf_test
+
+# 5. Combine with your rolling-diff covariates
+newdata <- cbind(
+  as.data.frame(X_bt_surf_test)#,
+  #test_valid[, covariates]
+)
+
+# 6. Predict win‐probabilities
+preds <- predict(
+  glm_surf, 
+  newdata = newdata, 
+  type    = "response"
+)
+
+test_matches$pred_prob_bt_w_diffs_and_surf <- NA_real_
+test_matches$pred_prob_bt_w_diffs_and_surf[valid_idx] <- preds
+
+# evaluation metrics
+test_matches$correct_prediction <- test_matches$pred_prob_bt_w_diffs_and_surf > 0.5
+accuracy <- mean(test_matches$correct_prediction, na.rm = TRUE)
+misclassification_rate <- 1 - accuracy
+cat("Misclassification Rate:", misclassification_rate, "\n")
+
+test_matches$brier_score <- (1 - test_matches$pred_prob_bt_w_diffs_and_surf)^2
+mean_brier_score <- mean(test_matches$brier_score, na.rm = TRUE)
+cat("Mean Brier Score:", mean_brier_score, "\n")
+```
+
+```{r}
+### RANDOM FOREST ###
+library(randomForest)
+
+# 1. Identify your diff columns
+diff_cols <- grep("^diff", names(train_matches), value = TRUE)
+
+# 2. Build the RF training set
+rf_pos <- train_matches %>%
+  dplyr::select(all_of(diff_cols)) %>%
+  mutate(label = 1)
+
+rf_neg <- train_matches %>%
+  dplyr::select(all_of(diff_cols)) %>%
+  mutate(across(all_of(diff_cols), ~ -.),  # flip the diffs
+         label = 0)
+
+rf_train <- bind_rows(rf_pos, rf_neg)
+
+# 3. Fit a random forest
+set.seed(42)
+rf_mod <- randomForest(
+  x          = rf_train %>% dplyr::select(all_of(diff_cols)),
+  y          = factor(rf_train$label),   # as a factor for classification
+  ntree      = 500,
+  importance = TRUE
+)
+
+print(rf_mod)
+varImpPlot(rf_mod)  # see which diffs matter most
+
+# 4. Predict on your test set
+rf_test <- test_matches %>%
+  filter(season > 2014) %>%
+  dplyr::select(all_of(diff_cols))
+
+# P(label=1) = probability that the “first‐player” (i.e. winner_name) wins
+test_matches$rf_prob <- predict(rf_mod, newdata = rf_test, type = "prob")[, "1"]
+
+# 5. Evaluate
+test_matches <- test_matches %>%
+  mutate(
+    rf_pred_win = rf_prob > 0.5,
+    rf_brier    = (1 - rf_prob)^2  # since actual label is 1 for “winner_name”
+  )
+
+misclass_rf <- mean(!test_matches$rf_pred_win[test_matches$season > 2014])
+brier_rf     <- mean(test_matches$rf_brier[test_matches$season > 2014])
+
+cat("RF misclassification rate:", round(misclass_rf,4), "\n")
+cat("RF mean Brier score:       ", round(brier_rf,4), "\n")
+
+```
+
+```{r}
+### CLUSTERING ###
+library(factoextra)   # for fviz_nbclust() & fviz_cluster()
+
+train_test_matches <- matches %>% filter(season >= 2019)
+
+# 1 & 2) stack winners and losers, flipping sign for losers
+player_surface <- bind_rows(
+  train_test_matches %>% 
+    select(surface, player = winner_name, all_of(covariates)),
+  train_test_matches %>% 
+    select(surface, player = loser_name, all_of(covariates)) %>% 
+    mutate(across(all_of(covariates), ~ - .x))
+)
+
+# 3) average per player times surface
+player_surface <- player_surface %>%
+  group_by(player, surface) %>%
+  summarise(
+    across(all_of(covariates), ~ mean(.x, na.rm = TRUE)),
+    n_matches = n(),
+    .groups = "drop"
+  ) %>%
+  select(-n_matches)
+
+# 4) pivot to wide: one row per player, cols = covariate_surface
+player_wide <- player_surface %>%
+  pivot_wider(
+    id_cols     = player,
+    names_from  = surface,
+    values_from = all_of(covariates),
+    names_sep   = "_"
+  ) %>%
+  drop_na()   # drop players missing any surface
+
+# 5) scale features
+feat_mat <- player_wide %>% select(-player)
+feat_scaled <- scale(feat_mat)
+
+# 6) elbow plot
+fviz_nbclust(
+  feat_scaled, 
+  kmeans, 
+  method = "wss", 
+  k.max  = 25
+) +
+  labs(
+    subtitle = "Elbow method",
+    x = "Number of clusters k",
+    y = "Total within-cluster sum of squares"
+  )
+
+# 7) run k-means
+set.seed(123)
+km <- kmeans(feat_scaled, centers = 10, nstart = 25)
+
+# 8) attach cluster back
+player_clusters <- player_wide %>%
+  mutate(cluster = km$cluster)
+
+# now `player_clusters` has columns:
+#   player | diff_rolling_10_df_per_svgm_Clay | … | diff_h2h_Hard | cluster
+#
+# can inspect each cluster’s “specialty” by:
+cluster_summary <- player_clusters %>%
+  bind_cols(as_tibble(feat_scaled)) %>%
+  group_by(cluster) %>%
+  summarize(across(
+    contains("svpt"),    mean, na.rm = TRUE
+  ), across(
+    contains("df_per_svgm"), mean, na.rm = TRUE
+  ), across(
+    contains("1stWon"),   mean, na.rm = TRUE
+  ), across(
+    contains("2ndWon"),   mean, na.rm = TRUE
+  ))
+```
+
+```{r}
+library(ggplot2)
+library(ggrepel)
+library(dplyr)
+library(colorspace)
+
+# PCA projection of your scaled features
+pca_res <- prcomp(feat_scaled, center = TRUE, scale. = FALSE)
+
+# build the scores data.frame
+scores <- as.data.frame(pca_res$x[, 1:2])
+colnames(scores) <- c("PC1", "PC2")
+scores$player  <- player_clusters$player
+scores$cluster <- factor(player_clusters$cluster)
+
+
+# generate distinct HCL hues
+pal <- qualitative_hcl(10, palette = "Dark 3")
+
+ggplot(scores, aes(PC1, PC2, color = cluster, label = player)) +
+  geom_point(size = 2, alpha = 0.8) +
+  geom_text_repel(
+    max.overlaps  = 45,
+    size          = 2,
+    box.padding   = 0.4,
+    point.padding = 0.3
+  ) +
+  scale_color_manual(values = pal) +
+  theme_minimal(base_size = 14) +
+  labs(
+    title    = "Serve-Specialist Clusters on PC1 vs PC2",
+    x        = "PC1",
+    y        = "PC2",
+    color    = "Cluster"
+  )
+```

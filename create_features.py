@@ -217,6 +217,42 @@ def add_rolling_features(df, player_rolling_stats, window=10):
     
     return df_features
 
+def add_ratio_features(df, window=10):
+    """Add ratio features comparing winner stats to combined stats.
+    
+    Args:
+        df: DataFrame containing match data with rolling features
+        window: Window size used for rolling statistics
+        
+    Returns:
+        pandas.DataFrame: DataFrame with added ratio features
+    """
+    logging.info("Creating ratio features")
+    
+    df_features = df.copy()
+    
+    # Create ratio features for each rolling stat
+    for prefix in rolling_prefixes:
+        w_col = f'w_rolling_{window}_{prefix}'
+        l_col = f'l_rolling_{window}_{prefix}'
+        
+        # Only create ratio if both columns exist
+        if w_col in df_features.columns and l_col in df_features.columns:
+            ratio_col = f'ratio_{prefix}'
+            
+            # Calculate the ratio: w_stat / (w_stat + l_stat)
+            # Handle division by zero and NaN values
+            df_features[ratio_col] = df_features.apply(
+                lambda row: row[w_col] / (row[w_col] + row[l_col]) 
+                if pd.notna(row[w_col]) and pd.notna(row[l_col]) and (row[w_col] + row[l_col]) > 0 
+                else np.nan, 
+                axis=1
+            )
+            
+            logging.info(f"Created ratio feature: {ratio_col}")
+    
+    return df_features
+
 def add_head_to_head_features(df):
     """Add head-to-head record features for each matchup.
     
@@ -297,6 +333,9 @@ def main():
     
     # Add rolling features to the matches DataFrame
     df_features = add_rolling_features(df, player_rolling_stats, window)
+    
+    # Add ratio features
+    df_features = add_ratio_features(df_features, window)
     
     # Add head-to-head features
     df_features = add_head_to_head_features(df_features)
